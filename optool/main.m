@@ -53,6 +53,7 @@ int main(int argc, const char * argv[]) {
         XPMArgumentSignature *strip = [XPMArgumentSignature argumentSignatureWithFormat:@"[s strip]"];
         XPMArgumentSignature *restore = [XPMArgumentSignature argumentSignatureWithFormat:@"[r restore]"];
         XPMArgumentSignature *install = [XPMArgumentSignature argumentSignatureWithFormat:@"[i install]"];
+        XPMArgumentSignature *weaken = [XPMArgumentSignature argumentSignatureWithFormat:@"[w weaken]"];
         XPMArgumentSignature *rename = [XPMArgumentSignature argumentSignatureWithFormat:@"[r rename]={1,2}"];
         XPMArgumentSignature *uninstall = [XPMArgumentSignature argumentSignatureWithFormat:@"[u uninstall]"];
         XPMArgumentSignature *aslr = [XPMArgumentSignature argumentSignatureWithFormat:@"[a aslr]"];
@@ -61,6 +62,7 @@ int main(int argc, const char * argv[]) {
         [strip setInjectedSignatures:[NSSet setWithObjects:target, weak, nil]];
         [restore setInjectedSignatures:[NSSet setWithObjects:target, nil]];
         [install setInjectedSignatures:[NSSet setWithObjects:target, payload, nil]];
+        [weaken setInjectedSignatures:[NSSet setWithObjects:target, payload, nil]];
         [uninstall setInjectedSignatures:[NSSet setWithObjects:target, payload, nil]];
         [aslr setInjectedSignatures:[NSSet setWithObjects:target, nil]];
         [unrestrict setInjectedSignatures:[NSSet setWithObjects:target, weak, nil]];
@@ -70,7 +72,7 @@ int main(int argc, const char * argv[]) {
         [payload setInjectedSignatures:[NSSet setWithObjects:install, uninstall, nil]];
         [command setInjectedSignatures:[NSSet setWithObjects:install, nil]];
 
-        XPMArgumentPackage *package = [[NSProcessInfo processInfo] xpmargs_parseArgumentsWithSignatures:@[resign, command, strip, restore, install, uninstall, output, backup, aslr, help, unrestrict, rename]];
+        XPMArgumentPackage *package = [[NSProcessInfo processInfo] xpmargs_parseArgumentsWithSignatures:@[resign, command, strip, restore, install, weaken, uninstall, output, backup, aslr, help, unrestrict, rename]];
 
         NSString *targetPath = [package firstObjectForSignature:target];
         if (!targetPath || [package unknownSwitches].count > 0 || [package booleanValueForSignature:help]) {
@@ -154,7 +156,13 @@ int main(int argc, const char * argv[]) {
                 } else {
                     LOG("Sucessfully removed restrict section");
                 }
-                
+            } else if ([package booleanValueForSignature:weaken]) {
+                if (weakenLoadEntryFromBinary(binary, macho, dylibPath)) {
+                    LOG("Successfully weakened all entries for %s", dylibPath.UTF8String);
+                } else {
+                    LOG("No entries for %s exist to weaken", dylibPath.UTF8String);
+                    return OPErrorNoEntries;
+                }
             } else if ([package booleanValueForSignature:uninstall]) {
                 if (removeLoadEntryFromBinary(binary, macho, dylibPath)) {
                     LOG("Successfully removed all entries for %s", dylibPath.UTF8String);
@@ -262,6 +270,7 @@ int main(int argc, const char * argv[]) {
             LOG("USAGE:");
             SHOW(@"install -c <command> -p <payload> -t <target> [-o=<output>] [-b] [--resign] Inserts an LC_LOAD command into the target binary which points to the payload. This may render some executables unusable.");
             SHOW(@"uninstall -p <payload> -t <target> [-o=<output>] [-b] [--resign] Removes any LC_LOAD commands which point to a given payload from the target binary. This may render some executables unusable.");
+            SHOW(@"weaken -p <payload> -t <target> [-o=<output>] [-b] [--resign] Weakens any LC_LOAD commands which point to a given payload from the target binary. This may render some executables unusable.");
             SHOW(@"strip [-w] -t <target> Removes a code signature load command from the given binary.");
             SHOW(@"unrestrict [-w] -t <target> Removes a __restrict section from the given binary. The weak flag makes this a non-destructive operation which merely renames the __restrict section to something not understandable by dyld; otherwise, this operation removes all the __restrict data from the binary.");
             SHOW(@"restore -t <target> Restores any backup made on the target by this tool.");

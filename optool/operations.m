@@ -241,6 +241,137 @@ BOOL unrestrictBinary(NSMutableData *binary, struct thin_header macho, BOOL soft
     return success;
 }
 
+BOOL weakenLoadEntryFromBinary(NSMutableData *binary, struct thin_header macho, NSString *payload) {
+    // parse load commands to see if our load command is already there
+    binary.currentOffset = macho.offset + macho.size;
+    
+    uint32_t num = 1, weakenedOrdinal = -1;
+    NSRange dyldInfoRange = {.location = NSNotFound};
+    
+    for (int i = 0; i < macho.header.ncmds; i++) {
+        if (binary.currentOffset >= binary.length ||
+            binary.currentOffset > macho.offset + macho.size + macho.header.sizeofcmds)
+            break;
+        
+        uint32_t cmd  = [binary intAtOffset:binary.currentOffset];
+        uint32_t size = [binary intAtOffset:binary.currentOffset + 4];
+        
+        switch (cmd) {
+            case LC_REEXPORT_DYLIB:
+            case LC_LOAD_UPWARD_DYLIB:
+            case LC_LOAD_WEAK_DYLIB:
+            case LC_LOAD_DYLIB: {
+                
+                struct dylib_command command = *(struct dylib_command *)(binary.bytes + binary.currentOffset);
+                char *name = (char *)[[binary subdataWithRange:NSMakeRange(binary.currentOffset + command.dylib.name.offset, command.cmdsize - command.dylib.name.offset)] bytes];
+                if ([@(name) isEqualToString:payload] && weakenedOrdinal == -1) {
+                    LOG("weakening payload from %s %s...", LC(cmd), name);
+                    // weaken load command
+                    // remove these bytes and append zeroes to the end of the header
+                    [binary replaceBytesInRange:NSMakeRange(binary.currentOffset, 4) withBytes:"\x18\x00\x00\x80" length:4];
+                    weakenedOrdinal = num;
+                }
+                num++;
+                binary.currentOffset += size;
+                break;
+            }
+                
+            case LC_DYLD_INFO:
+            case LC_DYLD_INFO_ONLY:
+                dyldInfoRange = NSMakeRange(binary.currentOffset, size);
+                binary.currentOffset += size;
+                break;
+            default:
+                binary.currentOffset += size;
+                break;
+        }
+    }
+    
+    if (dyldInfoRange.location == NSNotFound || weakenedOrdinal == -1) {
+        LOG("Library not found, treating as symbol");
+    }
+    
+    struct dyld_info_command info;
+    [binary getBytes:&info range:dyldInfoRange];
+    
+    uint8_t *p = (uint8_t *)binary.mutableBytes + info.bind_off;
+    uint8_t *p_end = p + info.bind_size;
+    int32_t libOrdinal = -1;
+    uint32_t weakenedSymbols = 0;
+    
+    while (p < p_end) {
+        uint8_t opcode = *p & BIND_OPCODE_MASK;
+        uint8_t immediate = *p & BIND_IMMEDIATE_MASK;
+        switch (opcode) {
+            case BIND_OPCODE_DONE:
+                p++;
+                break;
+            case BIND_OPCODE_SET_DYLIB_ORDINAL_IMM:
+                libOrdinal = immediate;
+                p++;
+                break;
+            case BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB: {
+                uint32_t len = 0;
+                libOrdinal = (int32_t)read_uleb128(p+1, &len);
+                p += 1 + len;
+                break; }
+            case BIND_OPCODE_SET_DYLIB_SPECIAL_IMM:
+                // Special means negative
+                if (immediate == 0) {
+                    libOrdinal = 0;
+                } else {
+                    int8_t signExtended = immediate | BIND_OPCODE_MASK; // This sign extends the value
+                    libOrdinal = signExtended;
+                }
+                p++;
+                break;
+            case BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM: {
+                // weaken
+                const char *symbolName = (const char*)p+1;
+                if ((weakenedOrdinal > -1 && libOrdinal == weakenedOrdinal) || [@(symbolName) isEqualToString:payload]) {
+                    LOG("weakening symbol %s", symbolName);
+                    weakenedSymbols++;
+                    p[0] |= BIND_SYMBOL_FLAGS_WEAK_IMPORT;
+                }
+                p += 1 + strlen(symbolName) + 1;
+                break; }
+            case BIND_OPCODE_SET_TYPE_IMM:
+            case BIND_OPCODE_DO_BIND:
+            case BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED:
+                // skip over opcode
+                p++;
+                break;
+            case BIND_OPCODE_SET_ADDEND_SLEB:
+            case BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB:
+            case BIND_OPCODE_ADD_ADDR_ULEB:
+            case BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB:
+            {
+                // skip over opcode + ULEB
+                uint32_t len = 0;
+                read_uleb128(p+1, &len);
+                p += 1 + len;
+                break;
+            }
+            case BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB:
+            {
+                p++;
+                uint32_t len = 0;
+                read_uleb128(p, &len);
+                p += len;
+                read_uleb128(p, &len);
+                p += len;
+                break;
+            }
+            default:
+                [NSException raise:@"Bind info" format:@"Unknown opcode (%02x %02x) at %p",
+                 ((uint32_t)-1 & opcode), ((uint32_t)-1 & immediate), p - (uint64_t)binary.mutableBytes];
+                break;
+        }
+    }
+
+    return weakenedSymbols > 0 || weakenedOrdinal > -1;
+}
+
 BOOL removeLoadEntryFromBinary(NSMutableData *binary, struct thin_header macho, NSString *payload) {
     // parse load commands to see if our load command is already there
     binary.currentOffset = macho.offset + macho.size;
